@@ -22,7 +22,7 @@
 // ============================================================
 
 constexpr char APP_NAME[] = "GEOMETEO LOGGER";
-constexpr char APP_VERSION[] = "v0.8.0";
+constexpr char APP_VERSION[] = "v0.8.2 (STABLE)";
 
 // ============================================================
 // HARDVER: INTERNA I2C ZBERNICA - DOTYK
@@ -249,6 +249,12 @@ constexpr uint16_t COLOR_OK = TFT_GREEN;
 uint16_t COLOR_WARNING = COLOR_PRIMARY;
 constexpr uint16_t COLOR_ERROR = TFT_RED;
 
+// Stavové bodky na hlavnej obrazovke nepodliehajú farebnej téme.
+// Zelená = OK, oranžová = upozornenie/neaktívny stav, červená = chyba.
+constexpr uint16_t STATUS_COLOR_OK = 0x07E0;
+constexpr uint16_t STATUS_COLOR_WARNING = 0xFD20;
+constexpr uint16_t STATUS_COLOR_ERROR = 0xF800;
+
 // ============================================================
 // BITMAPA IKONY NASTAVENI - 32 x 32 px
 // Zdroj: gear.txt. Nulove bity tvoria samotny symbol ozubenia.
@@ -383,7 +389,12 @@ enum class AccentTheme : uint8_t
     Blue,
     Green,
     Red,
-    Purple
+    Purple,
+    Gray,
+    Yellow,
+    Lime,
+    Cream,
+    Pink
 };
 
 struct AccentPalette
@@ -436,6 +447,46 @@ constexpr AccentPalette ACCENT_PALETTES[] = {
         "FIALOVA",
         "#ab47bc",
         "#672a72"
+    },
+    {
+        0x9CF3,
+        0xD69A,
+        0x5AEB,
+        "SEDA",
+        "#9e9e9e",
+        "#5e5e5e"
+    },
+    {
+        0xFEC6,
+        0xFF8E,
+        0x8BA2,
+        "ZLTA",
+        "#fdd835",
+        "#8a7715"
+    },
+    {
+        0xB709,
+        0xD7AF,
+        0x5BA3,
+        "LIMETKOVA",
+        "#b7e04a",
+        "#58751f"
+    },
+    {
+        0xF738,
+        0xFFBA,
+        0x8BAA,
+        "KREMOVA",
+        "#f3e5c0",
+        "#8a7650"
+    },
+    {
+        0xEAD2,
+        0xF538,
+        0x898B,
+        "RUZOVA",
+        "#ec5a90",
+        "#8a3158"
     }
 };
 
@@ -685,11 +736,20 @@ constexpr Rect SETTINGS_GENERAL_SAVE_RECT{165, 410, 145, 54};
 // ============================================================
 
 constexpr Rect THEME_OPTION_RECTS[ACCENT_THEME_COUNT] = {
-    {10, 62, 300, 58},
-    {10, 130, 300, 58},
-    {10, 198, 300, 58},
-    {10, 266, 300, 58},
-    {10, 334, 300, 58}
+    {10, 58, 145, 56},
+    {165, 58, 145, 56},
+
+    {10, 122, 145, 56},
+    {165, 122, 145, 56},
+
+    {10, 186, 145, 56},
+    {165, 186, 145, 56},
+
+    {10, 250, 145, 56},
+    {165, 250, 145, 56},
+
+    {10, 314, 145, 56},
+    {165, 314, 145, 56}
 };
 
 constexpr Rect THEME_BACK_RECT{10, 414, 145, 50};
@@ -2787,14 +2847,14 @@ uint16_t statusColor(StatusState state)
     switch (state)
     {
         case StatusState::Ok:
-            return COLOR_OK;
+            return STATUS_COLOR_OK;
 
         case StatusState::Warning:
-            return COLOR_WARNING;
+            return STATUS_COLOR_WARNING;
 
         case StatusState::Error:
         default:
-            return COLOR_ERROR;
+            return STATUS_COLOR_ERROR;
     }
 }
 
@@ -10566,7 +10626,7 @@ void drawThemeSettingsScreen()
                 ? TFT_WHITE
                 : palette.panelBorder,
             TFT_BLACK,
-            2
+            1
         );
 
         if (selected)
