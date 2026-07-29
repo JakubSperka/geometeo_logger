@@ -3,8 +3,8 @@
 **Prenosný záznamník atmosférických parametrov pre geodetické merania**
 
 > [!NOTE]
-> Dokumentácia opisuje aktuálnu vývojovú vetvu **v0.8.0**.  
-> Posledný overený stabilný build základnej funkcionality je **v0.8.0**.
+> Dokumentácia opisuje aktuálnu vývojovú vetvu **v0.8.2**.  
+> Posledný overený stabilný build základnej funkcionality je **v0.8.2**.
 
 GeoMeteo Logger je prenosné zariadenie určené na meranie a záznam:
 
@@ -909,18 +909,6 @@ Zmena používateľských nastavení, napríklad kalibračných koeficientov, ja
 ---
 
 ## Licencia
-
-> [!NOTE]
-> **PLACEHOLDER – LICENCIA**  
-> Doplňte vybranú licenciu projektu do súboru `LICENSE`.
-
-Odporúčaná licencia pre otvorený firmvér:
-
-```text
-GNU General Public License v3.0
-```
-
-alebo:
 
 ```text
 MIT License
