@@ -4,7 +4,7 @@
 
 > [!NOTE]
 > Dokumentácia opisuje aktuálnu vývojovú vetvu **v0.8.0**.  
-> Posledný overený stabilný build základnej funkcionality je **v0.7.6**.
+> Posledný overený stabilný build základnej funkcionality je **v0.8.0**.
 
 GeoMeteo Logger je prenosné zariadenie určené na meranie a záznam:
 
@@ -932,15 +932,11 @@ Výber závisí od požadovaných podmienok ďalšieho používania a úprav.
 
 ## Autor a kontakt
 
-> [!NOTE]
-> **PLACEHOLDER – AUTOR A KONTAKT**  
-> Doplňte meno autora, pracovisko, e‑mail a odkaz na repozitár.
-
 ```text
-Autor:
-Pracovisko:
-E-mail:
-Repozitár:
+Autor: Jakub Špekra
+Pracovisko: Karedra globálnej geodézie a geoinformatiky, Stavebná Fakulta STU v Bratislava
+E-mail: jakub.sperka@stuba.sk
+Repozitár: geometeo_logger
 ```
 
 ---
