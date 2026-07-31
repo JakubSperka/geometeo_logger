@@ -22,7 +22,7 @@
 // ============================================================
 
 constexpr char APP_NAME[] = "GEOMETEO LOGGER";
-constexpr char APP_VERSION[] = "v0.8.2 (STABLE)";
+constexpr char APP_VERSION[] = "v0.9.0 (STABLE)";
 
 // ============================================================
 // HARDVER: INTERNA I2C ZBERNICA - DOTYK
@@ -73,6 +73,41 @@ constexpr uint8_t BATTERY_CRITICAL_PERCENT = 10;
 
 constexpr uint32_t SD_RECOVERY_INTERVAL_MS = 5000;
 constexpr uint8_t SD_WRITE_ATTEMPTS = 2;
+
+// Ochrana FAT32 a volneho miesta.
+// Jeden FAT32 subor moze mat najviac 4 GiB - 1 B. Relacia sa
+// preventivne rozdeli uz pri 3800 MiB, aby zostala bezpecna rezerva.
+constexpr uint64_t FAT32_MAX_FILE_SIZE_BYTES = 0xFFFFFFFFULL;
+
+// Pre overenie delenia bez vytvarania viacgigabajtoveho suboru
+// mozno docasne nastavit STORAGE_ROTATION_TEST_MODE na true.
+// V produkcnej verzii musi zostat false.
+constexpr bool STORAGE_ROTATION_TEST_MODE = false;
+
+constexpr uint64_t SESSION_FILE_ROTATE_LIMIT_BYTES =
+    STORAGE_ROTATION_TEST_MODE
+        ? 64ULL * 1024ULL
+        : 3800ULL * 1024ULL * 1024ULL;
+
+constexpr uint64_t SD_LOW_SPACE_WARNING_BYTES =
+    32ULL * 1024ULL * 1024ULL;
+
+constexpr uint64_t SD_NORMAL_FREE_RESERVE_BYTES =
+    4ULL * 1024ULL * 1024ULL;
+
+constexpr uint64_t SD_EMERGENCY_FREE_RESERVE_BYTES =
+    64ULL * 1024ULL;
+
+constexpr uint32_t SD_SPACE_CHECK_INTERVAL_MS = 5000;
+constexpr size_t SESSION_FILE_PATH_LENGTH = 112;
+constexpr size_t SESSION_MAX_FILE_PARTS = 32;
+constexpr size_t CSV_RECORD_ESTIMATE_BYTES = 1024;
+
+static_assert(
+    SESSION_FILE_ROTATE_LIMIT_BYTES <
+        FAT32_MAX_FILE_SIZE_BYTES,
+    "Limit rotacie musi byt mensi ako limit FAT32."
+);
 
 constexpr float MIN_VALID_TEMPERATURE_C = -40.0F;
 constexpr float MAX_VALID_TEMPERATURE_C = 85.0F;
@@ -165,6 +200,15 @@ constexpr size_t IDENTIFIER_MAX_LENGTH = 16;
 
 constexpr char SESSION_DIRECTORY[] = "/sessions";
 
+constexpr char SESSION_CSV_HEADER[] =
+    "session_id,timestamp,record_type,station,target_point,"
+    "temperature_c,humidity_pct,pressure_hpa,"
+    "battery_voltage_v,battery_percent,"
+    "temperature_raw_c,humidity_raw_pct,pressure_raw_hpa,"
+    "calibration_enabled,temperature_scale,temperature_offset_c,"
+    "humidity_scale,humidity_offset_pct,"
+    "pressure_scale,pressure_offset_hpa";
+
 // ============================================================
 // WI-FI EXPORT UKONCENYCH RELACII
 // ============================================================
@@ -206,7 +250,7 @@ constexpr uint32_t GRAPH_ALL_REFRESH_MIN_INTERVAL_MS = 10000;
 // Pri vacsom pocte suborov zostane dostupnych 96 najnovsich.
 constexpr size_t ARCHIVE_MAX_SESSIONS = 96;
 constexpr size_t ARCHIVE_PAGE_SIZE = 5;
-constexpr size_t ARCHIVE_PATH_LENGTH = 96;
+constexpr size_t ARCHIVE_PATH_LENGTH = SESSION_FILE_PATH_LENGTH;
 constexpr size_t ARCHIVE_SESSION_ID_LENGTH = 32;
 constexpr size_t ARCHIVE_CSV_LINE_LENGTH = 384;
 
@@ -595,7 +639,8 @@ struct ArchiveSession
     char station[IDENTIFIER_MAX_LENGTH + 1];
     uint32_t startUnix;
     uint32_t endUnix;
-    uint32_t fileSize;
+    uint64_t fileSize;
+    uint16_t partCount;
 };
 
 struct ArchiveSessionDetailData
@@ -608,6 +653,8 @@ struct ArchiveSessionDetailData
     uint32_t endUnix;
     uint32_t autoRecordCount;
     uint32_t manualRecordCount;
+    uint16_t partCount;
+    uint64_t totalFileSize;
     GraphStatistics temperatureStats;
     GraphStatistics humidityStats;
     GraphStatistics pressureStats;
@@ -859,17 +906,41 @@ Measurement currentMeasurement{
 
 Measurement readMeasurement();
 
+// Explicit declarations for helpers used before their implementation.
+bool hasCsvExtension(const char *fileName);
+
+uint16_t sessionPartIndexFromPath(
+    const char *path
+);
+
+void deriveSessionBaseFilePath(
+    const char *currentPath,
+    char *basePath,
+    size_t basePathSize
+);
+
+size_t collectSessionPartPaths(
+    const char *wantedSessionId,
+    char paths[][SESSION_FILE_PATH_LENGTH],
+    uint16_t partIndices[],
+    size_t maximumParts
+);
+
 char station[IDENTIFIER_MAX_LENGTH + 1] = "";
 char targetPoint[IDENTIFIER_MAX_LENGTH + 1] = "";
 char editBuffer[IDENTIFIER_MAX_LENGTH + 1] = "";
 
 char sessionId[32] = "";
-char sessionFilePath[80] = "";
+char sessionBaseFilePath[SESSION_FILE_PATH_LENGTH] = "";
+char sessionFilePath[SESSION_FILE_PATH_LENGTH] = "";
+uint16_t sessionFilePartIndex = 1;
 
 char recoveredStation[IDENTIFIER_MAX_LENGTH + 1] = "";
 char recoveredTargetPoint[IDENTIFIER_MAX_LENGTH + 1] = "";
 char recoveredSessionId[32] = "";
-char recoveredSessionFilePath[80] = "";
+char recoveredSessionBaseFilePath[SESSION_FILE_PATH_LENGTH] = "";
+char recoveredSessionFilePath[SESSION_FILE_PATH_LENGTH] = "";
+uint16_t recoveredSessionFilePartIndex = 1;
 uint32_t recoveredManualRecordCount = 0;
 
 char statusMessage[64] = "";
@@ -879,7 +950,16 @@ uint32_t lastSensorMillis = 0;
 uint32_t lastAutoLogMillis = 0;
 uint32_t lastBatteryMillis = 0;
 uint32_t lastSdRecoveryAttemptMillis = 0;
+uint32_t lastSdSpaceCheckMillis = 0;
 uint32_t saveFeedbackUntil = 0;
+
+uint64_t sdTotalBytes = 0;
+uint64_t sdUsedBytes = 0;
+uint64_t sdFreeBytes = 0;
+bool sdSpaceInfoValid = false;
+bool sdSpaceLow = false;
+bool sdSpaceCritical = false;
+bool sdWriteBlockedBySpace = false;
 uint32_t statusMessageUntil = 0;
 uint32_t manualRecordCount = 0;
 
@@ -1011,6 +1091,14 @@ size_t archiveCurrentPage = 0;
 int16_t selectedArchiveSessionIndex = -1;
 
 ArchiveSessionDetailData archiveDetailData{};
+
+// Zdielany buffer pre zoznam casti jednej relacie.
+// Funkcie bezia sekvencne v hlavnej slucke, preto sa buffer
+// moze opakovane pouzit bez zatazenia zasobnika.
+char sharedSessionPartPaths[
+    SESSION_MAX_FILE_PARTS
+][SESSION_FILE_PATH_LENGTH];
+
 char archiveStatusMessage[64] = "";
 
 // ============================================================
@@ -1095,6 +1183,7 @@ bool manualSaveAvailable()
     return
         touchReady &&
         sdReady &&
+        !sdSpaceCritical &&
         sessionActive &&
         currentMeasurement.valid &&
         !identifierIsEmpty(station) &&
@@ -1214,7 +1303,10 @@ bool recordTypeAllowsInvalidMeasurement(
 {
     return
         recordType != nullptr &&
-        strncmp(recordType, "SESSION_", 8) == 0;
+        (
+            strncmp(recordType, "SESSION_", 8) == 0 ||
+            strncmp(recordType, "FILE_", 5) == 0
+        );
 }
 
 // ============================================================
@@ -1229,7 +1321,9 @@ void clearPersistentSessionState()
     preferences.remove("sess_st");
     preferences.remove("sess_tgt");
     preferences.remove("sess_id");
+    preferences.remove("sess_base");
     preferences.remove("sess_file");
+    preferences.remove("sess_part");
     preferences.remove("sess_man");
 
     preferences.end();
@@ -1262,8 +1356,18 @@ void persistActiveSessionState()
         );
 
         preferences.putString(
+            "sess_base",
+            sessionBaseFilePath
+        );
+
+        preferences.putString(
             "sess_file",
             sessionFilePath
+        );
+
+        preferences.putUShort(
+            "sess_part",
+            sessionFilePartIndex
         );
 
         preferences.putULong(
@@ -1276,7 +1380,9 @@ void persistActiveSessionState()
         preferences.remove("sess_st");
         preferences.remove("sess_tgt");
         preferences.remove("sess_id");
+        preferences.remove("sess_base");
         preferences.remove("sess_file");
+        preferences.remove("sess_part");
         preferences.remove("sess_man");
     }
 
@@ -1311,10 +1417,22 @@ bool loadPendingSessionRecovery()
             ""
         );
 
+    const String storedBaseFilePath =
+        preferences.getString(
+            "sess_base",
+            ""
+        );
+
     const String storedFilePath =
         preferences.getString(
             "sess_file",
             ""
+        );
+
+    const uint16_t storedPartIndex =
+        preferences.getUShort(
+            "sess_part",
+            1
         );
 
     const uint32_t storedManualCount =
@@ -1356,6 +1474,32 @@ bool loadPendingSessionRecovery()
         sizeof(recoveredSessionFilePath)
     );
 
+    if (storedBaseFilePath.length() > 0)
+    {
+        storedBaseFilePath.toCharArray(
+            recoveredSessionBaseFilePath,
+            sizeof(recoveredSessionBaseFilePath)
+        );
+    }
+    else
+    {
+        deriveSessionBaseFilePath(
+            recoveredSessionFilePath,
+            recoveredSessionBaseFilePath,
+            sizeof(recoveredSessionBaseFilePath)
+        );
+    }
+
+    const uint16_t detectedPartIndex =
+        sessionPartIndexFromPath(
+            recoveredSessionFilePath
+        );
+
+    recoveredSessionFilePartIndex =
+        storedPartIndex > 1
+            ? storedPartIndex
+            : detectedPartIndex;
+
     recoveredManualRecordCount =
         storedManualCount;
 
@@ -1395,7 +1539,9 @@ void resetRuntimeSessionState()
     targetPoint[0] = '\0';
 
     sessionId[0] = '\0';
+    sessionBaseFilePath[0] = '\0';
     sessionFilePath[0] = '\0';
+    sessionFilePartIndex = 1;
 
     manualRecordCount = 0;
     saveButtonState = SaveButtonState::Idle;
@@ -1423,11 +1569,23 @@ void restoreRecoveredSessionToRuntime()
     );
 
     snprintf(
+        sessionBaseFilePath,
+        sizeof(sessionBaseFilePath),
+        "%s",
+        recoveredSessionBaseFilePath
+    );
+
+    snprintf(
         sessionFilePath,
         sizeof(sessionFilePath),
         "%s",
         recoveredSessionFilePath
     );
+
+    sessionFilePartIndex =
+        recoveredSessionFilePartIndex > 0
+            ? recoveredSessionFilePartIndex
+            : 1;
 
     manualRecordCount =
         recoveredManualRecordCount;
@@ -2941,9 +3099,11 @@ void updateStatusPanel()
     snprintf(
         signature,
         sizeof(signature),
-        "%u|%u|%u|%u|%lu",
+        "%u|%u|%u|%u|%u|%u|%lu",
         sensorsAreReady() ? 1U : 0U,
         sdReady ? 1U : 0U,
+        sdSpaceLow ? 1U : 0U,
+        sdSpaceCritical ? 1U : 0U,
         sessionActive ? 1U : 0U,
         static_cast<unsigned int>(autoState),
         static_cast<unsigned long>(
@@ -2979,9 +3139,12 @@ void updateStatusPanel()
         420,
         "SD",
         -1,
-        sdReady
-            ? StatusState::Ok
-            : StatusState::Error
+        !sdReady ||
+        sdSpaceCritical
+            ? StatusState::Error
+            : sdSpaceLow
+                ? StatusState::Warning
+                : StatusState::Ok
     );
 
     drawCompactStatus(
@@ -3624,21 +3787,38 @@ void updateMessageStrip()
 
 void drawSessionButtons()
 {
+    const bool startBlocked =
+        !sessionActive &&
+        (
+            !sdReady ||
+            sdSpaceCritical
+        );
+
     drawButton(
         SESSION_TOGGLE_BUTTON_RECT,
         sessionActive
             ? "UKONCIT RELACIU"
-            : "SPUSTIT RELACIU",
+            : startBlocked
+                ? "SD KARTA NEMA MIESTO"
+                : "SPUSTIT RELACIU",
         sessionActive
             ? COLOR_PANEL
-            : COLOR_PRIMARY,
+            : startBlocked
+                ? COLOR_BACKGROUND
+                : COLOR_PRIMARY,
         sessionActive
             ? COLOR_WARNING
-            : COLOR_PRIMARY,
+            : startBlocked
+                ? COLOR_ERROR
+                : COLOR_PRIMARY,
         sessionActive
             ? COLOR_TEXT
-            : TFT_BLACK,
-        2
+            : startBlocked
+                ? COLOR_ERROR
+                : TFT_BLACK,
+        startBlocked
+            ? 1
+            : 2
     );
 }
 
@@ -3669,6 +3849,11 @@ void drawSaveButton()
         fillColor = COLOR_PANEL;
         borderColor = COLOR_PRIMARY;
         buttonText = "ULOZIT MERANIE";
+    }
+    else if (sdSpaceCritical)
+    {
+        borderColor = COLOR_ERROR;
+        buttonText = "SD KARTA JE PLNA";
     }
     else if (!sessionActive)
     {
@@ -4163,6 +4348,16 @@ const char *currentGraphStation()
     return station;
 }
 
+const char *currentGraphSessionId()
+{
+    if (graphViewingArchive)
+    {
+        return archiveDetailData.sessionId;
+    }
+
+    return sessionId;
+}
+
 
 bool scanGraphSessionFile(
     GraphRange requestedRange
@@ -4178,12 +4373,12 @@ bool scanGraphSessionFile(
 
     resetAllGraphStatistics();
 
-    const char *sourceFilePath =
-        currentGraphFilePath();
+    const char *sourceSessionId =
+        currentGraphSessionId();
 
     if (
-        sourceFilePath == nullptr ||
-        sourceFilePath[0] == '\0' ||
+        sourceSessionId == nullptr ||
+        sourceSessionId[0] == '\0' ||
         (
             !graphViewingArchive &&
             !sessionActive
@@ -4210,17 +4405,24 @@ bool scanGraphSessionFile(
         return false;
     }
 
-    File file = SD.open(
-        sourceFilePath,
-        FILE_READ
-    );
+    uint16_t partIndices[
+        SESSION_MAX_FILE_PARTS
+    ];
 
-    if (!file)
+    const size_t partCount =
+        collectSessionPartPaths(
+            sourceSessionId,
+            sharedSessionPartPaths,
+            partIndices,
+            SESSION_MAX_FILE_PARTS
+        );
+
+    if (partCount == 0)
     {
         snprintf(
             graphErrorMessage,
             sizeof(graphErrorMessage),
-            "CSV SUBOR SA NEDA OTVORIT"
+            "CSV CASTI RELACIE SA NENASLI"
         );
 
         return false;
@@ -4230,91 +4432,114 @@ bool scanGraphSessionFile(
     size_t recentCount = 0;
     size_t recentWriteIndex = 0;
 
-    while (
-        readCsvLine(
-            file,
-            line,
-            sizeof(line)
-        )
+    for (
+        size_t part = 0;
+        part < partCount;
+        part++
     )
     {
-        GraphSample sample{};
-        bool isAutoRecord = false;
-        bool isManualRecord = false;
-        bool hasTimestamp = false;
-
-        const bool parsed =
-            parseGraphCsvRecord(
-                line,
-                sample,
-                isAutoRecord,
-                isManualRecord,
-                hasTimestamp
-            );
-
-        if (
-            hasTimestamp &&
-            graphSessionStartUnix == 0
-        )
-        {
-            graphSessionStartUnix =
-                sample.unixTime;
-        }
-
-        if (hasTimestamp)
-        {
-            graphSessionLastUnix =
-                sample.unixTime;
-        }
-
-        if (isManualRecord)
-        {
-            graphTotalManualRecords++;
-        }
-
-        if (
-            !parsed ||
-            !isAutoRecord
-        )
-        {
-            continue;
-        }
-
-        graphTotalAutoRecords++;
-
-        addSampleToStatistics(
-            sample,
-            graphTotalTemperatureStats,
-            graphTotalHumidityStats,
-            graphTotalPressureStats
+        File file = SD.open(
+            sharedSessionPartPaths[part],
+            FILE_READ
         );
 
-        if (
-            requestedRange ==
-            GraphRange::Last120
+        if (!file)
+        {
+            snprintf(
+                graphErrorMessage,
+                sizeof(graphErrorMessage),
+                "CSV CAST SA NEDA OTVORIT"
+            );
+
+            return false;
+        }
+
+        while (
+            readCsvLine(
+                file,
+                line,
+                sizeof(line)
+            )
         )
         {
-            graphRecentBuffer[
-                recentWriteIndex
-            ] = sample;
+            GraphSample sample{};
+            bool isAutoRecord = false;
+            bool isManualRecord = false;
+            bool hasTimestamp = false;
 
-            recentWriteIndex =
-                (
-                    recentWriteIndex + 1
-                ) %
-                GRAPH_LAST_RECORD_COUNT;
+            const bool parsed =
+                parseGraphCsvRecord(
+                    line,
+                    sample,
+                    isAutoRecord,
+                    isManualRecord,
+                    hasTimestamp
+                );
 
             if (
-                recentCount <
-                GRAPH_LAST_RECORD_COUNT
+                hasTimestamp &&
+                graphSessionStartUnix == 0
             )
             {
-                recentCount++;
+                graphSessionStartUnix =
+                    sample.unixTime;
+            }
+
+            if (hasTimestamp)
+            {
+                graphSessionLastUnix =
+                    sample.unixTime;
+            }
+
+            if (isManualRecord)
+            {
+                graphTotalManualRecords++;
+            }
+
+            if (
+                !parsed ||
+                !isAutoRecord
+            )
+            {
+                continue;
+            }
+
+            graphTotalAutoRecords++;
+
+            addSampleToStatistics(
+                sample,
+                graphTotalTemperatureStats,
+                graphTotalHumidityStats,
+                graphTotalPressureStats
+            );
+
+            if (
+                requestedRange ==
+                GraphRange::Last120
+            )
+            {
+                graphRecentBuffer[
+                    recentWriteIndex
+                ] = sample;
+
+                recentWriteIndex =
+                    (
+                        recentWriteIndex + 1
+                    ) %
+                    GRAPH_LAST_RECORD_COUNT;
+
+                if (
+                    recentCount <
+                    GRAPH_LAST_RECORD_COUNT
+                )
+                {
+                    recentCount++;
+                }
             }
         }
-    }
 
-    file.close();
+        file.close();
+    }
 
     if (graphTotalAutoRecords == 0)
     {
@@ -4361,24 +4586,8 @@ bool scanGraphSessionFile(
         return graphDataReady;
     }
 
-    // Druhy prechod pre volbu VSETKY. Data sa priebezne
-    // priemeruju do najviac 240 zobrazovanych bodov.
-    file = SD.open(
-        sourceFilePath,
-        FILE_READ
-    );
-
-    if (!file)
-    {
-        snprintf(
-            graphErrorMessage,
-            sizeof(graphErrorMessage),
-            "CSV SUBOR SA NEDA OTVORIT"
-        );
-
-        return false;
-    }
-
+    // Druhy prechod cez vsetky casti relacie. Data sa
+    // priebezne priemeruju do najviac 240 bodov.
     const uint32_t bucketSize =
         (
             graphTotalAutoRecords +
@@ -4393,82 +4602,105 @@ bool scanGraphSessionFile(
     double pressureSum = 0.0;
     uint32_t bucketUnixTime = 0;
 
-    while (
-        readCsvLine(
-            file,
-            line,
-            sizeof(line)
-        )
+    for (
+        size_t part = 0;
+        part < partCount;
+        part++
     )
     {
-        GraphSample sample{};
-        bool isAutoRecord = false;
-        bool isManualRecord = false;
-        bool hasTimestamp = false;
+        File file = SD.open(
+            sharedSessionPartPaths[part],
+            FILE_READ
+        );
 
-        if (
-            !parseGraphCsvRecord(
+        if (!file)
+        {
+            snprintf(
+                graphErrorMessage,
+                sizeof(graphErrorMessage),
+                "CSV CAST SA NEDA OTVORIT"
+            );
+
+            return false;
+        }
+
+        while (
+            readCsvLine(
+                file,
                 line,
-                sample,
-                isAutoRecord,
-                isManualRecord,
-                hasTimestamp
-            ) ||
-            !isAutoRecord
+                sizeof(line)
+            )
         )
         {
-            continue;
+            GraphSample sample{};
+            bool isAutoRecord = false;
+            bool isManualRecord = false;
+            bool hasTimestamp = false;
+
+            if (
+                !parseGraphCsvRecord(
+                    line,
+                    sample,
+                    isAutoRecord,
+                    isManualRecord,
+                    hasTimestamp
+                ) ||
+                !isAutoRecord
+            )
+            {
+                continue;
+            }
+
+            if (bucketCount == 0)
+            {
+                bucketUnixTime =
+                    sample.unixTime;
+            }
+
+            temperatureSum +=
+                sample.temperatureC;
+
+            humiditySum +=
+                sample.humidityPercent;
+
+            pressureSum +=
+                sample.pressureHpa;
+
+            bucketCount++;
+
+            if (
+                bucketCount >= bucketSize &&
+                graphPointCount <
+                GRAPH_MAX_POINT_COUNT
+            )
+            {
+                graphSamples[
+                    graphPointCount++
+                ] = GraphSample{
+                    bucketUnixTime,
+                    static_cast<float>(
+                        temperatureSum /
+                        bucketCount
+                    ),
+                    static_cast<float>(
+                        humiditySum /
+                        bucketCount
+                    ),
+                    static_cast<float>(
+                        pressureSum /
+                        bucketCount
+                    )
+                };
+
+                bucketCount = 0;
+                temperatureSum = 0.0;
+                humiditySum = 0.0;
+                pressureSum = 0.0;
+            }
         }
 
-        if (bucketCount == 0)
-        {
-            bucketUnixTime =
-                sample.unixTime;
-        }
-
-        temperatureSum +=
-            sample.temperatureC;
-
-        humiditySum +=
-            sample.humidityPercent;
-
-        pressureSum +=
-            sample.pressureHpa;
-
-        bucketCount++;
-
-        if (
-            bucketCount >= bucketSize &&
-            graphPointCount <
-            GRAPH_MAX_POINT_COUNT
-        )
-        {
-            graphSamples[
-                graphPointCount++
-            ] = GraphSample{
-                bucketUnixTime,
-                static_cast<float>(
-                    temperatureSum /
-                    bucketCount
-                ),
-                static_cast<float>(
-                    humiditySum /
-                    bucketCount
-                ),
-                static_cast<float>(
-                    pressureSum /
-                    bucketCount
-                )
-            };
-
-            bucketCount = 0;
-            temperatureSum = 0.0;
-            humiditySum = 0.0;
-            pressureSum = 0.0;
-        }
+        file.close();
     }
-
-    file.close();
 
     if (
         bucketCount > 0 &&
@@ -4495,8 +4727,6 @@ bool scanGraphSessionFile(
         };
     }
 
-    // Statistiky VSETKY zostavaju presne a nevychadzaju
-    // zo zmenseneho grafickeho vyberu.
     graphDisplayTemperatureStats =
         graphTotalTemperatureStats;
 
@@ -5678,33 +5908,55 @@ void formatArchiveDateTime(
 );
 
 String formatWebFileSize(
-    uint32_t bytes
+    uint64_t bytes
 )
 {
-    if (bytes < 1024U)
-    {
-        return
-            String(bytes) +
-            F(" B");
-    }
-
-    if (bytes < 1024UL * 1024UL)
+    if (bytes < 1024ULL)
     {
         return
             String(
-                bytes / 1024.0f,
+                static_cast<unsigned long>(
+                    bytes
+                )
+            ) +
+            F(" B");
+    }
+
+    if (bytes < 1024ULL * 1024ULL)
+    {
+        return
+            String(
+                bytes / 1024.0,
                 1
             ) +
             F(" kB");
     }
 
+    if (
+        bytes <
+        1024ULL * 1024ULL * 1024ULL
+    )
+    {
+        return
+            String(
+                bytes /
+                (1024.0 * 1024.0),
+                2
+            ) +
+            F(" MB");
+    }
+
     return
         String(
             bytes /
-            (1024.0f * 1024.0f),
+            (
+                1024.0 *
+                1024.0 *
+                1024.0
+            ),
             2
         ) +
-        F(" MB");
+        F(" GB");
 }
 
 void markWifiExportActivity()
@@ -5757,6 +6009,7 @@ void sendWifiExportPageHeader(
             ".session{display:grid;grid-template-columns:1fr auto;"
             "gap:10px;align-items:center}"
             ".meta{color:#bbb;font-size:.92rem;margin-top:5px}"
+            ".parts{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}"
             "a.button{display:inline-block;background:"
         )
     );
@@ -5804,6 +6057,7 @@ void handleWifiExportRoot()
     markWifiExportActivity();
 
     loadArchiveSessions();
+    refreshSdSpaceInfo(true);
 
     wifiExportServer.sendHeader(
         "Cache-Control",
@@ -5846,6 +6100,19 @@ void handleWifiExportRoot()
     info += String(archiveSessionCount);
     info += F("<br><strong>Pripojene zariadenia:</strong> ");
     info += String(WiFi.softAPgetStationNum());
+
+    if (sdSpaceInfoValid)
+    {
+        info += F("<br><strong>Volne miesto:</strong> ");
+        info += formatWebFileSize(
+            sdFreeBytes
+        );
+        info += F(" z ");
+        info += formatWebFileSize(
+            sdTotalBytes
+        );
+    }
+
     info += F("</div>");
 
     wifiExportServer.sendContent(info);
@@ -5881,8 +6148,23 @@ void handleWifiExportRoot()
                 true
             );
 
+            uint16_t partIndices[
+                SESSION_MAX_FILE_PARTS
+            ];
+
+            const size_t partCount =
+                collectSessionPartPaths(
+                    item.sessionId,
+                    sharedSessionPartPaths,
+                    partIndices,
+                    SESSION_MAX_FILE_PARTS
+                );
+
             String row;
-            row.reserve(420);
+            row.reserve(
+                520 +
+                partCount * 110
+            );
 
             row += F("<div class='session'><div><strong>");
             row += htmlEscape(item.station);
@@ -5890,13 +6172,40 @@ void handleWifiExportRoot()
             row += htmlEscape(dateBuffer);
             row += F(" &middot; ");
             row += formatWebFileSize(item.fileSize);
+            row += F(" &middot; casti: ");
+            row += String(partCount);
             row += F("<br>");
-            row += htmlEscape(
-                pathFileName(item.filePath)
-            );
-            row += F("</div></div><div><a class='button' href='/download?i=");
-            row += String(index);
-            row += F("'>STIAHNUT CSV</a></div></div>");
+            row += htmlEscape(item.sessionId);
+            row += F("</div></div><div class='parts'>");
+
+            for (
+                size_t part = 0;
+                part < partCount;
+                part++
+            )
+            {
+                row += F("<a class='button' href='/download?i=");
+                row += String(index);
+                row += F("&p=");
+                row += String(part);
+                row += F("'>");
+
+                if (partCount == 1)
+                {
+                    row += F("STIAHNUT CSV");
+                }
+                else
+                {
+                    row += F("CAST ");
+                    row += String(
+                        partIndices[part]
+                    );
+                }
+
+                row += F("</a>");
+            }
+
+            row += F("</div></div>");
 
             wifiExportServer.sendContent(row);
         }
@@ -5914,10 +6223,12 @@ void handleWifiExportDownload()
         wifiExportServer.send(
             400,
             "text/plain; charset=utf-8",
-            "Chyba indexu suboru."
+            "Chyba indexu relacie."
         );
         return;
     }
+
+    loadArchiveSessions();
 
     const String indexText =
         wifiExportServer.arg("i");
@@ -5945,30 +6256,70 @@ void handleWifiExportDownload()
         return;
     }
 
+    unsigned long requestedPart = 0;
+
+    if (wifiExportServer.hasArg("p"))
+    {
+        const String partText =
+            wifiExportServer.arg("p");
+
+        endPointer = nullptr;
+
+        requestedPart =
+            strtoul(
+                partText.c_str(),
+                &endPointer,
+                10
+            );
+
+        if (
+            endPointer ==
+                partText.c_str() ||
+            *endPointer != '\0'
+        )
+        {
+            wifiExportServer.send(
+                400,
+                "text/plain; charset=utf-8",
+                "Chyba indexu casti."
+            );
+            return;
+        }
+    }
+
     const ArchiveSession &item =
         archiveSessions[index];
 
-    // Dodatochna kontrola zaruci, ze sa neposkytne aktivny
-    // alebo nedokonceny subor ani po zmene obsahu SD karty.
-    ArchiveSession verified{};
+    uint16_t partIndices[
+        SESSION_MAX_FILE_PARTS
+    ];
+
+    const size_t partCount =
+        collectSessionPartPaths(
+            item.sessionId,
+            sharedSessionPartPaths,
+            partIndices,
+            SESSION_MAX_FILE_PARTS
+        );
 
     if (
-        !loadArchiveSessionOverview(
-            item.filePath,
-            verified
-        )
+        partCount == 0 ||
+        requestedPart >= partCount
     )
     {
         wifiExportServer.send(
-            409,
+            404,
             "text/plain; charset=utf-8",
-            "Subor nie je ukoncena relacia."
+            "Cast relacie sa nenasla."
         );
         return;
     }
 
+    const char *downloadPath =
+        sharedSessionPartPaths[requestedPart];
+
     File downloadFile = SD.open(
-        verified.filePath,
+        downloadPath,
         FILE_READ
     );
 
@@ -5984,7 +6335,7 @@ void handleWifiExportDownload()
 
     const char *fileName =
         pathFileName(
-            verified.filePath
+            downloadPath
         );
 
     String disposition =
@@ -6010,13 +6361,14 @@ void handleWifiExportDownload()
 
     downloadFile.close();
 
-    // Prenos moze trvat dlhsie ako bezna HTTP poziadavka.
-    // Casovy limit preto pocitame az od jeho dokoncenia.
     markWifiExportActivity();
 
     Serial.printf(
-        "WI-FI EXPORT: odoslany %s\n",
-        verified.filePath
+        "WI-FI EXPORT: odoslany %s | CAST %u\n",
+        downloadPath,
+        static_cast<unsigned int>(
+            partIndices[requestedPart]
+        )
     );
 }
 
@@ -6998,18 +7350,15 @@ bool loadArchiveSessionOverview(
         return false;
     }
 
-    File file = SD.open(
+    File closingFile = SD.open(
         filePath,
         FILE_READ
     );
 
-    if (!file)
+    if (!closingFile)
     {
         return false;
     }
-
-    session.fileSize =
-        file.size();
 
     char firstSessionId[
         ARCHIVE_SESSION_ID_LENGTH
@@ -7023,7 +7372,7 @@ bool loadArchiveSessionOverview(
 
     const bool firstRecordOk =
         readFirstArchiveRecord(
-            file,
+            closingFile,
             firstSessionId,
             sizeof(firstSessionId),
             firstStation,
@@ -7037,12 +7386,12 @@ bool loadArchiveSessionOverview(
 
     const bool lastLineOk =
         readLastNonEmptyCsvLine(
-            file,
+            closingFile,
             lastLine,
             sizeof(lastLine)
         );
 
-    file.close();
+    closingFile.close();
 
     if (
         !firstRecordOk ||
@@ -7073,19 +7422,150 @@ bool loadArchiveSessionOverview(
             lastRecordType,
             sizeof(lastRecordType),
             lastUnix
-        )
-    )
-    {
-        return false;
-    }
-
-    if (
+        ) ||
         !isClosedSessionRecordType(
             lastRecordType
         )
     )
     {
         return false;
+    }
+
+    uint16_t partIndices[
+        SESSION_MAX_FILE_PARTS
+    ];
+
+    const size_t partCount =
+        collectSessionPartPaths(
+            firstSessionId,
+            sharedSessionPartPaths,
+            partIndices,
+            SESSION_MAX_FILE_PARTS
+        );
+
+    if (partCount == 0)
+    {
+        return false;
+    }
+
+    uint32_t aggregateStartUnix = 0;
+    uint32_t aggregateEndUnix = 0;
+    uint64_t aggregateSize = 0;
+
+    char aggregateStation[
+        IDENTIFIER_MAX_LENGTH + 1
+    ] = "";
+
+    for (
+        size_t part = 0;
+        part < partCount;
+        part++
+    )
+    {
+        File partFile = SD.open(
+            sharedSessionPartPaths[part],
+            FILE_READ
+        );
+
+        if (!partFile)
+        {
+            return false;
+        }
+
+        aggregateSize +=
+            static_cast<uint64_t>(
+                partFile.size()
+            );
+
+        char partSessionId[
+            ARCHIVE_SESSION_ID_LENGTH
+        ] = "";
+
+        char partStation[
+            IDENTIFIER_MAX_LENGTH + 1
+        ] = "";
+
+        uint32_t partStartUnix = 0;
+
+        if (
+            readFirstArchiveRecord(
+                partFile,
+                partSessionId,
+                sizeof(partSessionId),
+                partStation,
+                sizeof(partStation),
+                partStartUnix
+            )
+        )
+        {
+            if (
+                aggregateStartUnix == 0 ||
+                partStartUnix <
+                    aggregateStartUnix
+            )
+            {
+                aggregateStartUnix =
+                    partStartUnix;
+            }
+
+            if (
+                aggregateStation[0] == '\0' &&
+                partStation[0] != '\0'
+            )
+            {
+                snprintf(
+                    aggregateStation,
+                    sizeof(aggregateStation),
+                    "%s",
+                    partStation
+                );
+            }
+        }
+
+        char partLastLine[
+            ARCHIVE_CSV_LINE_LENGTH
+        ];
+
+        if (
+            readLastNonEmptyCsvLine(
+                partFile,
+                partLastLine,
+                sizeof(partLastLine)
+            )
+        )
+        {
+            char parsedId[
+                ARCHIVE_SESSION_ID_LENGTH
+            ] = "";
+
+            char parsedStation[
+                IDENTIFIER_MAX_LENGTH + 1
+            ] = "";
+
+            char parsedType[32] = "";
+            uint32_t partEndUnix = 0;
+
+            if (
+                parseArchiveIdentityLine(
+                    partLastLine,
+                    parsedId,
+                    sizeof(parsedId),
+                    parsedStation,
+                    sizeof(parsedStation),
+                    parsedType,
+                    sizeof(parsedType),
+                    partEndUnix
+                ) &&
+                partEndUnix >
+                    aggregateEndUnix
+            )
+            {
+                aggregateEndUnix =
+                    partEndUnix;
+            }
+        }
+
+        partFile.close();
     }
 
     snprintf(
@@ -7106,13 +7586,30 @@ bool loadArchiveSessionOverview(
         session.station,
         sizeof(session.station),
         "%s",
-        firstStation[0] != '\0'
-            ? firstStation
-            : "---"
+        aggregateStation[0] != '\0'
+            ? aggregateStation
+            : firstStation[0] != '\0'
+                ? firstStation
+                : "---"
     );
 
-    session.startUnix = firstUnix;
-    session.endUnix = lastUnix;
+    session.startUnix =
+        aggregateStartUnix > 0
+            ? aggregateStartUnix
+            : firstUnix;
+
+    session.endUnix =
+        aggregateEndUnix > 0
+            ? aggregateEndUnix
+            : lastUnix;
+
+    session.fileSize =
+        aggregateSize;
+
+    session.partCount =
+        static_cast<uint16_t>(
+            partCount
+        );
 
     return true;
 }
@@ -7556,20 +8053,10 @@ void drawArchiveListScreen()
             1
         );
 
-        char sizeLine[20];
-
-        snprintf(
-            sizeLine,
-            sizeof(sizeLine),
-            "%lu kB",
-            static_cast<unsigned long>(
-                (
-                    item.fileSize +
-                    1023
-                ) /
-                1024
-            )
-        );
+        const String sizeLine =
+            formatWebFileSize(
+                item.fileSize
+            );
 
         tft.setTextDatum(MR_DATUM);
         tft.setTextColor(
@@ -7578,7 +8065,7 @@ void drawArchiveListScreen()
         );
 
         tft.drawString(
-            sizeLine,
+            sizeLine.c_str(),
             rowRect.x +
                 rowRect.width -
                 12,
@@ -7791,17 +8278,30 @@ bool loadArchiveDetailData(
     archiveDetailData.endUnix =
         selected.endUnix;
 
+    archiveDetailData.partCount =
+        selected.partCount;
+
+    archiveDetailData.totalFileSize =
+        selected.fileSize;
+
     if (!ensureSDReady(false))
     {
         return false;
     }
 
-    File file = SD.open(
-        archiveDetailData.filePath,
-        FILE_READ
-    );
+    uint16_t partIndices[
+        SESSION_MAX_FILE_PARTS
+    ];
 
-    if (!file)
+    const size_t partCount =
+        collectSessionPartPaths(
+            selected.sessionId,
+            sharedSessionPartPaths,
+            partIndices,
+            SESSION_MAX_FILE_PARTS
+        );
+
+    if (partCount == 0)
     {
         return false;
     }
@@ -7810,67 +8310,97 @@ bool loadArchiveDetailData(
         ARCHIVE_CSV_LINE_LENGTH
     ];
 
-    while (
-        readCsvLine(
-            file,
-            line,
-            sizeof(line)
-        )
+    for (
+        size_t part = 0;
+        part < partCount;
+        part++
     )
     {
-        GraphSample sample{};
-        bool isAutoRecord = false;
-        bool isManualRecord = false;
-        bool hasTimestamp = false;
-
-        const bool parsed =
-            parseGraphCsvRecord(
-                line,
-                sample,
-                isAutoRecord,
-                isManualRecord,
-                hasTimestamp
-            );
-
-        if (
-            hasTimestamp &&
-            archiveDetailData.startUnix == 0
-        )
-        {
-            archiveDetailData.startUnix =
-                sample.unixTime;
-        }
-
-        if (hasTimestamp)
-        {
-            archiveDetailData.endUnix =
-                sample.unixTime;
-        }
-
-        if (isManualRecord)
-        {
-            archiveDetailData.manualRecordCount++;
-        }
-
-        if (
-            !parsed ||
-            !isAutoRecord
-        )
-        {
-            continue;
-        }
-
-        archiveDetailData.autoRecordCount++;
-
-        addSampleToStatistics(
-            sample,
-            archiveDetailData.temperatureStats,
-            archiveDetailData.humidityStats,
-            archiveDetailData.pressureStats
+        File file = SD.open(
+            sharedSessionPartPaths[part],
+            FILE_READ
         );
+
+        if (!file)
+        {
+            return false;
+        }
+
+        while (
+            readCsvLine(
+                file,
+                line,
+                sizeof(line)
+            )
+        )
+        {
+            GraphSample sample{};
+            bool isAutoRecord = false;
+            bool isManualRecord = false;
+            bool hasTimestamp = false;
+
+            const bool parsed =
+                parseGraphCsvRecord(
+                    line,
+                    sample,
+                    isAutoRecord,
+                    isManualRecord,
+                    hasTimestamp
+                );
+
+            if (
+                hasTimestamp &&
+                (
+                    archiveDetailData.startUnix == 0 ||
+                    sample.unixTime <
+                        archiveDetailData.startUnix
+                )
+            )
+            {
+                archiveDetailData.startUnix =
+                    sample.unixTime;
+            }
+
+            if (
+                hasTimestamp &&
+                sample.unixTime >
+                    archiveDetailData.endUnix
+            )
+            {
+                archiveDetailData.endUnix =
+                    sample.unixTime;
+            }
+
+            if (isManualRecord)
+            {
+                archiveDetailData.manualRecordCount++;
+            }
+
+            if (
+                !parsed ||
+                !isAutoRecord
+            )
+            {
+                continue;
+            }
+
+            archiveDetailData.autoRecordCount++;
+
+            addSampleToStatistics(
+                sample,
+                archiveDetailData.temperatureStats,
+                archiveDetailData.humidityStats,
+                archiveDetailData.pressureStats
+            );
+        }
+
+        file.close();
     }
 
-    file.close();
+    archiveDetailData.partCount =
+        static_cast<uint16_t>(
+            partCount
+        );
 
     archiveDetailData.loaded = true;
 
@@ -8003,6 +8533,22 @@ void drawArchiveDetailScreen()
         char endText[32];
         char durationText[20];
         char countText[40];
+
+        String storageText =
+            F("CASTI: ");
+
+        storageText +=
+            String(
+                archiveDetailData.partCount
+            );
+
+        storageText +=
+            F(" | VELKOST: ");
+
+        storageText +=
+            formatWebFileSize(
+                archiveDetailData.totalFileSize
+            );
 
         formatArchiveDateTime(
             archiveDetailData.startUnix,
@@ -8147,6 +8693,18 @@ void drawArchiveDetailScreen()
 
         tft.setTextDatum(MC_DATUM);
         tft.setTextColor(
+            COLOR_SECONDARY_TEXT,
+            COLOR_PANEL
+        );
+
+        tft.drawString(
+            storageText.c_str(),
+            160,
+            198,
+            1
+        );
+
+        tft.setTextColor(
             COLOR_TEXT,
             COLOR_PANEL
         );
@@ -8154,7 +8712,7 @@ void drawArchiveDetailScreen()
         tft.drawString(
             countText,
             160,
-            218,
+            222,
             2
         );
 
@@ -12012,6 +12570,654 @@ bool ensureSessionDirectory()
     return SD.mkdir(SESSION_DIRECTORY);
 }
 
+
+const char *sessionPathFileName(
+    const char *path
+)
+{
+    if (path == nullptr)
+    {
+        return "";
+    }
+
+    const char *lastSlash =
+        strrchr(path, '/');
+
+    return
+        lastSlash != nullptr
+            ? lastSlash + 1
+            : path;
+}
+
+const char *findLastPartSuffix(
+    const char *path
+)
+{
+    if (path == nullptr)
+    {
+        return nullptr;
+    }
+
+    const char *result = nullptr;
+    const char *cursor = path;
+
+    while (true)
+    {
+        const char *candidate =
+            strstr(cursor, "_part");
+
+        if (candidate == nullptr)
+        {
+            break;
+        }
+
+        result = candidate;
+        cursor = candidate + 5;
+    }
+
+    return result;
+}
+
+uint16_t sessionPartIndexFromPath(
+    const char *path
+)
+{
+    const char *partSuffix =
+        findLastPartSuffix(path);
+
+    const char *extension =
+        path != nullptr
+            ? strrchr(path, '.')
+            : nullptr;
+
+    if (
+        partSuffix == nullptr ||
+        extension == nullptr ||
+        partSuffix >= extension
+    )
+    {
+        return 1;
+    }
+
+    char *endPointer = nullptr;
+
+    const unsigned long parsed =
+        strtoul(
+            partSuffix + 5,
+            &endPointer,
+            10
+        );
+
+    if (
+        endPointer != extension ||
+        parsed < 2 ||
+        parsed > 999
+    )
+    {
+        return 1;
+    }
+
+    return static_cast<uint16_t>(parsed);
+}
+
+void deriveSessionBaseFilePath(
+    const char *currentPath,
+    char *basePath,
+    size_t basePathSize
+)
+{
+    if (
+        basePath == nullptr ||
+        basePathSize == 0
+    )
+    {
+        return;
+    }
+
+    basePath[0] = '\0';
+
+    if (currentPath == nullptr)
+    {
+        return;
+    }
+
+    const char *partSuffix =
+        findLastPartSuffix(currentPath);
+
+    const char *extension =
+        strrchr(currentPath, '.');
+
+    if (
+        partSuffix == nullptr ||
+        extension == nullptr ||
+        sessionPartIndexFromPath(currentPath) == 1
+    )
+    {
+        snprintf(
+            basePath,
+            basePathSize,
+            "%s",
+            currentPath
+        );
+
+        return;
+    }
+
+    const size_t prefixLength =
+        static_cast<size_t>(
+            partSuffix - currentPath
+        );
+
+    snprintf(
+        basePath,
+        basePathSize,
+        "%.*s.csv",
+        static_cast<int>(prefixLength),
+        currentPath
+    );
+}
+
+bool buildSessionPartFilePath(
+    const char *basePath,
+    uint16_t partIndex,
+    char *destination,
+    size_t destinationSize
+)
+{
+    if (
+        basePath == nullptr ||
+        basePath[0] == '\0' ||
+        destination == nullptr ||
+        destinationSize == 0 ||
+        partIndex == 0
+    )
+    {
+        return false;
+    }
+
+    if (partIndex == 1)
+    {
+        const int written = snprintf(
+            destination,
+            destinationSize,
+            "%s",
+            basePath
+        );
+
+        return
+            written > 0 &&
+            static_cast<size_t>(written) <
+                destinationSize;
+    }
+
+    const char *extension =
+        strrchr(basePath, '.');
+
+    const size_t prefixLength =
+        extension != nullptr
+            ? static_cast<size_t>(
+                extension - basePath
+            )
+            : strlen(basePath);
+
+    const int written = snprintf(
+        destination,
+        destinationSize,
+        "%.*s_part%02u.csv",
+        static_cast<int>(prefixLength),
+        basePath,
+        static_cast<unsigned int>(
+            partIndex
+        )
+    );
+
+    return
+        written > 0 &&
+        static_cast<size_t>(written) <
+            destinationSize;
+}
+
+bool pathBelongsToSessionId(
+    const char *path,
+    const char *wantedSessionId
+)
+{
+    if (
+        path == nullptr ||
+        wantedSessionId == nullptr ||
+        wantedSessionId[0] == '\0'
+    )
+    {
+        return false;
+    }
+
+    const char *fileName =
+        sessionPathFileName(path);
+
+    const size_t idLength =
+        strlen(wantedSessionId);
+
+    return
+        strncmp(
+            fileName,
+            wantedSessionId,
+            idLength
+        ) == 0 &&
+        fileName[idLength] == '_' &&
+        hasCsvExtension(fileName);
+}
+
+size_t collectSessionPartPaths(
+    const char *wantedSessionId,
+    char paths[][SESSION_FILE_PATH_LENGTH],
+    uint16_t partIndices[],
+    size_t maximumParts
+)
+{
+    if (
+        wantedSessionId == nullptr ||
+        wantedSessionId[0] == '\0' ||
+        paths == nullptr ||
+        partIndices == nullptr ||
+        maximumParts == 0 ||
+        !sdReady
+    )
+    {
+        return 0;
+    }
+
+    File directory = SD.open(
+        SESSION_DIRECTORY
+    );
+
+    if (
+        !directory ||
+        !directory.isDirectory()
+    )
+    {
+        if (directory)
+        {
+            directory.close();
+        }
+
+        return 0;
+    }
+
+    size_t count = 0;
+
+    while (count < maximumParts)
+    {
+        File entry =
+            directory.openNextFile();
+
+        if (!entry)
+        {
+            break;
+        }
+
+        if (entry.isDirectory())
+        {
+            entry.close();
+            continue;
+        }
+
+        const char *entryName =
+            entry.name();
+
+        char candidatePath[
+            SESSION_FILE_PATH_LENGTH
+        ];
+
+        if (
+            entryName != nullptr &&
+            entryName[0] == '/'
+        )
+        {
+            snprintf(
+                candidatePath,
+                sizeof(candidatePath),
+                "%s",
+                entryName
+            );
+        }
+        else
+        {
+            snprintf(
+                candidatePath,
+                sizeof(candidatePath),
+                "%s/%s",
+                SESSION_DIRECTORY,
+                entryName != nullptr
+                    ? entryName
+                    : ""
+            );
+        }
+
+        entry.close();
+
+        if (
+            !hasCsvExtension(
+                candidatePath
+            )
+        )
+        {
+            continue;
+        }
+
+        File identityFile = SD.open(
+            candidatePath,
+            FILE_READ
+        );
+
+        if (!identityFile)
+        {
+            continue;
+        }
+
+        char parsedSessionId[
+            ARCHIVE_SESSION_ID_LENGTH
+        ] = "";
+
+        char parsedStation[
+            IDENTIFIER_MAX_LENGTH + 1
+        ] = "";
+
+        uint32_t parsedStartUnix = 0;
+
+        const bool identityOk =
+            readFirstArchiveRecord(
+                identityFile,
+                parsedSessionId,
+                sizeof(parsedSessionId),
+                parsedStation,
+                sizeof(parsedStation),
+                parsedStartUnix
+            );
+
+        identityFile.close();
+
+        if (
+            !identityOk ||
+            strcmp(
+                parsedSessionId,
+                wantedSessionId
+            ) != 0
+        )
+        {
+            continue;
+        }
+
+        snprintf(
+            paths[count],
+            SESSION_FILE_PATH_LENGTH,
+            "%s",
+            candidatePath
+        );
+
+        partIndices[count] =
+            sessionPartIndexFromPath(
+                candidatePath
+            );
+
+        count++;
+    }
+
+    directory.close();
+
+    // Stabilne zoradenie podla cisla casti.
+    for (size_t left = 0; left < count; left++)
+    {
+        for (
+            size_t right = left + 1;
+            right < count;
+            right++
+        )
+        {
+            const bool swapNeeded =
+                partIndices[right] <
+                    partIndices[left] ||
+                (
+                    partIndices[right] ==
+                        partIndices[left] &&
+                    strcmp(
+                        paths[right],
+                        paths[left]
+                    ) < 0
+                );
+
+            if (!swapNeeded)
+            {
+                continue;
+            }
+
+            const uint16_t temporaryIndex =
+                partIndices[left];
+
+            partIndices[left] =
+                partIndices[right];
+
+            partIndices[right] =
+                temporaryIndex;
+
+            char temporaryPath[
+                SESSION_FILE_PATH_LENGTH
+            ];
+
+            snprintf(
+                temporaryPath,
+                sizeof(temporaryPath),
+                "%s",
+                paths[left]
+            );
+
+            snprintf(
+                paths[left],
+                SESSION_FILE_PATH_LENGTH,
+                "%s",
+                paths[right]
+            );
+
+            snprintf(
+                paths[right],
+                SESSION_FILE_PATH_LENGTH,
+                "%s",
+                temporaryPath
+            );
+        }
+    }
+
+    return count;
+}
+
+bool refreshSdSpaceInfo(
+    bool forceRefresh
+)
+{
+    if (!sdReady)
+    {
+        sdSpaceInfoValid = false;
+        sdSpaceLow = false;
+        sdSpaceCritical = false;
+        return false;
+    }
+
+    const uint32_t currentMillis =
+        millis();
+
+    if (
+        !forceRefresh &&
+        sdSpaceInfoValid &&
+        currentMillis -
+            lastSdSpaceCheckMillis <
+            SD_SPACE_CHECK_INTERVAL_MS
+    )
+    {
+        return true;
+    }
+
+    lastSdSpaceCheckMillis =
+        currentMillis;
+
+    sdTotalBytes =
+        static_cast<uint64_t>(
+            SD.totalBytes()
+        );
+
+    sdUsedBytes =
+        static_cast<uint64_t>(
+            SD.usedBytes()
+        );
+
+    sdSpaceInfoValid =
+        sdTotalBytes > 0 &&
+        sdUsedBytes <= sdTotalBytes;
+
+    if (!sdSpaceInfoValid)
+    {
+        sdFreeBytes = 0;
+        sdSpaceLow = false;
+        sdSpaceCritical = false;
+
+        Serial.println(
+            "SD: INFORMACIA O VOLNOM MIESTE NIE JE DOSTUPNA"
+        );
+
+        return false;
+    }
+
+    sdFreeBytes =
+        sdTotalBytes -
+        sdUsedBytes;
+
+    sdSpaceLow =
+        sdFreeBytes <=
+        SD_LOW_SPACE_WARNING_BYTES;
+
+    sdSpaceCritical =
+        sdFreeBytes <=
+        SD_NORMAL_FREE_RESERVE_BYTES;
+
+    return true;
+}
+
+bool recordTypeUsesEmergencyReserve(
+    const char *recordType
+)
+{
+    if (recordType == nullptr)
+    {
+        return false;
+    }
+
+    return
+        strcmp(
+            recordType,
+            "SESSION_END"
+        ) == 0 ||
+        strcmp(
+            recordType,
+            "SESSION_END_RECOVERY"
+        ) == 0 ||
+        strcmp(
+            recordType,
+            "SESSION_ABANDONED"
+        ) == 0 ||
+        strncmp(
+            recordType,
+            "FILE_",
+            5
+        ) == 0;
+}
+
+bool ensureSdFreeSpaceForRecord(
+    const char *recordType,
+    uint64_t estimatedAdditionalBytes,
+    bool forceRefresh
+)
+{
+    sdWriteBlockedBySpace = false;
+
+    if (!refreshSdSpaceInfo(forceRefresh))
+    {
+        // Ak karta neposkytne informaciu o kapacite, zapis sa
+        // neblokuje a zostava chraneny kontrolou chyby File.
+        return true;
+    }
+
+    const uint64_t reserveBytes =
+        recordTypeUsesEmergencyReserve(
+            recordType
+        )
+            ? SD_EMERGENCY_FREE_RESERVE_BYTES
+            : SD_NORMAL_FREE_RESERVE_BYTES;
+
+    if (
+        sdFreeBytes <
+        reserveBytes +
+            estimatedAdditionalBytes
+    )
+    {
+        sdWriteBlockedBySpace = true;
+        sdSpaceLow = true;
+        sdSpaceCritical = true;
+
+        Serial.printf(
+            "SD: NEDOSTATOK MIESTA | VOLNE=%llu B | REZERVA=%llu B\n",
+            static_cast<unsigned long long>(
+                sdFreeBytes
+            ),
+            static_cast<unsigned long long>(
+                reserveBytes
+            )
+        );
+
+        return false;
+    }
+
+    return true;
+}
+
+bool createSessionCsvFilePart(
+    const char *filePath
+)
+{
+    if (
+        filePath == nullptr ||
+        filePath[0] == '\0'
+    )
+    {
+        return false;
+    }
+
+    File logFile = SD.open(
+        filePath,
+        FILE_WRITE
+    );
+
+    if (!logFile)
+    {
+        return false;
+    }
+
+    logFile.println(
+        SESSION_CSV_HEADER
+    );
+
+    logFile.flush();
+
+    const bool writeOk =
+        logFile.getWriteError() == 0;
+
+    logFile.close();
+
+    if (!writeOk)
+    {
+        SD.remove(filePath);
+    }
+
+    return writeOk;
+}
+
 bool createSessionFile(
     const char *newStation
 )
@@ -12033,6 +13239,20 @@ bool createSessionFile(
     {
         Serial.println(
             "RELACIA: nepodarilo sa vytvorit adresar"
+        );
+        return false;
+    }
+
+    if (
+        !ensureSdFreeSpaceForRecord(
+            "SESSION_START",
+            2ULL * CSV_RECORD_ESTIMATE_BYTES,
+            true
+        )
+    )
+    {
+        Serial.println(
+            "RELACIA: NEDOSTATOK VOLNEHO MIESTA"
         );
         return false;
     }
@@ -12082,7 +13302,9 @@ bool createSessionFile(
     );
 
     char candidateSessionId[32] = "";
-    char candidateFilePath[80] = "";
+    char candidateFilePath[
+        SESSION_FILE_PATH_LENGTH
+    ] = "";
     bool uniquePathFound = false;
 
     for (uint8_t suffix = 0; suffix < 100; suffix++)
@@ -12131,42 +13353,14 @@ bool createSessionFile(
         return false;
     }
 
-    File logFile = SD.open(
-        candidateFilePath,
-        FILE_WRITE
-    );
-
-    if (!logFile)
+    if (
+        !createSessionCsvFilePart(
+            candidateFilePath
+        )
+    )
     {
         Serial.println(
             "RELACIA: nepodarilo sa vytvorit CSV subor"
-        );
-        return false;
-    }
-
-    logFile.println(
-        "session_id,timestamp,record_type,station,target_point,"
-        "temperature_c,humidity_pct,pressure_hpa,"
-        "battery_voltage_v,battery_percent,"
-        "temperature_raw_c,humidity_raw_pct,pressure_raw_hpa,"
-        "calibration_enabled,temperature_scale,temperature_offset_c,"
-        "humidity_scale,humidity_offset_pct,"
-        "pressure_scale,pressure_offset_hpa"
-    );
-
-    logFile.flush();
-
-    const bool writeOk =
-        logFile.getWriteError() == 0;
-
-    logFile.close();
-
-    if (!writeOk)
-    {
-        SD.remove(candidateFilePath);
-
-        Serial.println(
-            "RELACIA: nepodarilo sa zapisat hlavicku CSV"
         );
         return false;
     }
@@ -12178,12 +13372,20 @@ bool createSessionFile(
     );
 
     snprintf(
+        sessionBaseFilePath,
+        sizeof(sessionBaseFilePath),
+        "%s",
+        candidateFilePath
+    );
+
+    snprintf(
         sessionFilePath,
         sizeof(sessionFilePath),
         "%s",
         candidateFilePath
     );
 
+    sessionFilePartIndex = 1;
     sessionActive = true;
     lastAutoWriteOk = false;
     lastManualWriteOk = false;
@@ -12196,8 +13398,11 @@ bool createSessionFile(
     );
 
     Serial.printf(
-        "SUBOR: %s\n",
-        sessionFilePath
+        "SUBOR: %s | CAST: %u\n",
+        sessionFilePath,
+        static_cast<unsigned int>(
+            sessionFilePartIndex
+        )
     );
 
     persistActiveSessionState();
@@ -12209,7 +13414,8 @@ bool createSessionFile(
 // CSV - ZAPIS MERANIA
 // ============================================================
 
-bool writeSessionRecordOnce(
+bool writeSessionRecordToPathOnce(
+    const char *targetFilePath,
     const Measurement &measurement,
     const char *recordType,
     const char *recordStation,
@@ -12218,7 +13424,8 @@ bool writeSessionRecordOnce(
 {
     if (
         !sessionActive ||
-        sessionFilePath[0] == '\0'
+        targetFilePath == nullptr ||
+        targetFilePath[0] == '\0'
     )
     {
         return false;
@@ -12237,7 +13444,7 @@ bool writeSessionRecordOnce(
         return false;
     }
 
-    if (!SD.exists(sessionFilePath))
+    if (!SD.exists(targetFilePath))
     {
         Serial.printf(
             "CSV %s: SUBOR RELACIE SA NENASIEL\n",
@@ -12248,7 +13455,7 @@ bool writeSessionRecordOnce(
     }
 
     File logFile = SD.open(
-        sessionFilePath,
+        targetFilePath,
         FILE_APPEND
     );
 
@@ -12295,7 +13502,7 @@ bool writeSessionRecordOnce(
     }
     else
     {
-        // Udalosti SESSION_* sa zapisu aj pri chybe senzora.
+        // Udalosti SESSION_* a FILE_* sa zapisu aj pri chybe senzora.
         logFile.print(",,,");
     }
 
@@ -12344,7 +13551,238 @@ bool writeSessionRecordOnce(
 
     logFile.close();
 
+    if (
+        writeOk &&
+        sdSpaceInfoValid
+    )
+    {
+        sdFreeBytes =
+            sdFreeBytes >
+                CSV_RECORD_ESTIMATE_BYTES
+                ? sdFreeBytes -
+                    CSV_RECORD_ESTIMATE_BYTES
+                : 0;
+
+        sdSpaceLow =
+            sdFreeBytes <=
+            SD_LOW_SPACE_WARNING_BYTES;
+
+        sdSpaceCritical =
+            sdFreeBytes <=
+            SD_NORMAL_FREE_RESERVE_BYTES;
+    }
+
     return writeOk;
+}
+
+bool currentSessionFileNeedsRotation()
+{
+    if (
+        sessionFilePath[0] == '\0' ||
+        !SD.exists(sessionFilePath)
+    )
+    {
+        return false;
+    }
+
+    File file = SD.open(
+        sessionFilePath,
+        FILE_READ
+    );
+
+    if (!file)
+    {
+        return false;
+    }
+
+    const uint64_t currentSize =
+        static_cast<uint64_t>(
+            file.size()
+        );
+
+    file.close();
+
+    return
+        currentSize +
+            CSV_RECORD_ESTIMATE_BYTES >=
+        SESSION_FILE_ROTATE_LIMIT_BYTES;
+}
+
+bool rotateSessionFile(
+    const Measurement &measurement
+)
+{
+    if (
+        sessionBaseFilePath[0] == '\0'
+    )
+    {
+        deriveSessionBaseFilePath(
+            sessionFilePath,
+            sessionBaseFilePath,
+            sizeof(sessionBaseFilePath)
+        );
+    }
+
+    uint16_t nextPartIndex =
+        sessionFilePartIndex + 1;
+
+    char nextFilePath[
+        SESSION_FILE_PATH_LENGTH
+    ] = "";
+
+    while (
+        nextPartIndex <=
+            SESSION_MAX_FILE_PARTS
+    )
+    {
+        if (
+            !buildSessionPartFilePath(
+                sessionBaseFilePath,
+                nextPartIndex,
+                nextFilePath,
+                sizeof(nextFilePath)
+            )
+        )
+        {
+            return false;
+        }
+
+        if (!SD.exists(nextFilePath))
+        {
+            break;
+        }
+
+        nextPartIndex++;
+    }
+
+    if (
+        nextPartIndex >
+        SESSION_MAX_FILE_PARTS
+    )
+    {
+        Serial.println(
+            "CSV: DOSIAHNUTY MAXIMALNY POCET CASTI RELACIE"
+        );
+
+        return false;
+    }
+
+    if (
+        !ensureSdFreeSpaceForRecord(
+            "AUTO",
+            3ULL * CSV_RECORD_ESTIMATE_BYTES,
+            true
+        )
+    )
+    {
+        return false;
+    }
+
+    if (
+        !createSessionCsvFilePart(
+            nextFilePath
+        )
+    )
+    {
+        Serial.println(
+            "CSV: NEPODARILO SA VYTVORIT DALSIU CAST"
+        );
+
+        return false;
+    }
+
+    if (
+        !writeSessionRecordToPathOnce(
+            nextFilePath,
+            measurement,
+            "FILE_RESUME",
+            station,
+            ""
+        )
+    )
+    {
+        SD.remove(nextFilePath);
+
+        Serial.println(
+            "CSV: CHYBA ZAPISU FILE_RESUME"
+        );
+
+        return false;
+    }
+
+    if (
+        !writeSessionRecordToPathOnce(
+            sessionFilePath,
+            measurement,
+            "FILE_CONTINUE",
+            station,
+            ""
+        )
+    )
+    {
+        SD.remove(nextFilePath);
+
+        Serial.println(
+            "CSV: CHYBA ZAPISU FILE_CONTINUE"
+        );
+
+        return false;
+    }
+
+    snprintf(
+        sessionFilePath,
+        sizeof(sessionFilePath),
+        "%s",
+        nextFilePath
+    );
+
+    sessionFilePartIndex =
+        nextPartIndex;
+
+    persistActiveSessionState();
+
+    Serial.printf(
+        "CSV: RELACIA ROZDELENA | CAST %u | SUBOR %s\n",
+        static_cast<unsigned int>(
+            sessionFilePartIndex
+        ),
+        sessionFilePath
+    );
+
+    setStatusMessage(
+        "CSV ROZDELENE DO DALSEJ CASTI",
+        COLOR_WARNING,
+        4000
+    );
+
+    return true;
+}
+
+bool ensureCurrentSessionFileCapacity(
+    const Measurement &measurement,
+    const char *recordType
+)
+{
+    if (
+        recordTypeUsesEmergencyReserve(
+            recordType
+        )
+    )
+    {
+        // Ukoncovaci zaznam sa smie zapisat do aktualnej casti
+        // aj po prekroceni preventivneho limitu rotacie. Limit
+        // 3800 MiB ponechava velku rezervu do maxima FAT32.
+        return true;
+    }
+
+    if (!currentSessionFileNeedsRotation())
+    {
+        return true;
+    }
+
+    return rotateSessionFile(
+        measurement
+    );
 }
 
 bool appendMeasurementToSession(
@@ -12358,6 +13796,8 @@ bool appendMeasurementToSession(
     {
         return false;
     }
+
+    sdWriteBlockedBySpace = false;
 
     if (
         !measurement.valid &&
@@ -12392,7 +13832,35 @@ bool appendMeasurementToSession(
         }
 
         if (
-            writeSessionRecordOnce(
+            !ensureSdFreeSpaceForRecord(
+                recordType,
+                CSV_RECORD_ESTIMATE_BYTES,
+                forceRecovery
+            )
+        )
+        {
+            break;
+        }
+
+        if (
+            !ensureCurrentSessionFileCapacity(
+                measurement,
+                recordType
+            )
+        )
+        {
+            if (sdWriteBlockedBySpace)
+            {
+                break;
+            }
+
+            sdReady = false;
+            continue;
+        }
+
+        if (
+            writeSessionRecordToPathOnce(
+                sessionFilePath,
                 measurement,
                 recordType,
                 recordStation,
@@ -12401,8 +13869,11 @@ bool appendMeasurementToSession(
         )
         {
             Serial.printf(
-                "CSV %s: OK\n",
-                recordType
+                "CSV %s: OK | CAST %u\n",
+                recordType,
+                static_cast<unsigned int>(
+                    sessionFilePartIndex
+                )
             );
 
             return true;
@@ -12419,10 +13890,20 @@ bool appendMeasurementToSession(
         );
     }
 
-    Serial.printf(
-        "CSV %s: CHYBA PO OBNOVE SD\n",
-        recordType
-    );
+    if (sdWriteBlockedBySpace)
+    {
+        Serial.printf(
+            "CSV %s: ZAPIS ZABLOKOVANY - NEDOSTATOK MIESTA\n",
+            recordType
+        );
+    }
+    else
+    {
+        Serial.printf(
+            "CSV %s: CHYBA PO OBNOVE SD\n",
+            recordType
+        );
+    }
 
     return false;
 }
@@ -12455,7 +13936,9 @@ void endCurrentSession()
         persistActiveSessionState();
 
         setStatusMessage(
-            "RELACIU NIE JE MOZNE UKONCIT - SKONTROLUJ SD",
+            sdWriteBlockedBySpace
+                ? "NEDOSTATOK MIESTA NA UKONCENIE RELACIE"
+                : "RELACIU NIE JE MOZNE UKONCIT - SKONTROLUJ SD",
             COLOR_ERROR,
             5000
         );
@@ -12559,7 +14042,9 @@ void confirmKeyboardValue()
             sessionActive = false;
 
             setStatusMessage(
-                "CHYBA VYTVORENIA RELACIE",
+                sdWriteBlockedBySpace
+                    ? "SD KARTA NEMA DOSTATOK VOLNEHO MIESTA"
+                    : "CHYBA VYTVORENIA RELACIE",
                 COLOR_ERROR
             );
         }
@@ -12841,7 +14326,56 @@ bool initializeSD()
         return false;
     }
 
-    Serial.println("SD: OK");
+    sdTotalBytes =
+        static_cast<uint64_t>(
+            SD.totalBytes()
+        );
+
+    sdUsedBytes =
+        static_cast<uint64_t>(
+            SD.usedBytes()
+        );
+
+    sdSpaceInfoValid =
+        sdTotalBytes > 0 &&
+        sdUsedBytes <= sdTotalBytes;
+
+    if (sdSpaceInfoValid)
+    {
+        sdFreeBytes =
+            sdTotalBytes -
+            sdUsedBytes;
+
+        sdSpaceLow =
+            sdFreeBytes <=
+            SD_LOW_SPACE_WARNING_BYTES;
+
+        sdSpaceCritical =
+            sdFreeBytes <=
+            SD_NORMAL_FREE_RESERVE_BYTES;
+
+        Serial.printf(
+            "SD: OK | VOLNE %.2f MB Z %.2f MB\n",
+            sdFreeBytes /
+                (1024.0 * 1024.0),
+            sdTotalBytes /
+                (1024.0 * 1024.0)
+        );
+    }
+    else
+    {
+        sdFreeBytes = 0;
+        sdSpaceLow = false;
+        sdSpaceCritical = false;
+
+        Serial.println(
+            "SD: OK | KAPACITA SA NEDA ZISTIT"
+        );
+    }
+
+    lastSdSpaceCheckMillis =
+        millis();
+
     return true;
 }
 
@@ -12882,6 +14416,10 @@ bool ensureSDReady(bool forceRecovery)
 
     if (!sdReady)
     {
+        sdSpaceInfoValid = false;
+        sdSpaceLow = false;
+        sdSpaceCritical = false;
+
         Serial.println(
             "SD: OBNOVA ZLYHALA"
         );
@@ -13255,7 +14793,9 @@ void saveManualMeasurement()
         persistActiveSessionState();
 
         setStatusMessage(
-            "CHYBA SD - MANUALNY ZAZNAM NEBOL ULOZENY",
+            sdWriteBlockedBySpace
+                ? "SD KARTA JE PLNA - ZAZNAM NEBOL ULOZENY"
+                : "CHYBA SD - MANUALNY ZAZNAM NEBOL ULOZENY",
             COLOR_ERROR,
             5000
         );
@@ -13339,7 +14879,27 @@ void processMainTouch(int16_t x, int16_t y)
         }
         else
         {
-            openKeyboard(EditField::Station);
+            if (
+                !sdReady ||
+                sdSpaceCritical
+            )
+            {
+                setStatusMessage(
+                    sdSpaceCritical
+                        ? "SD KARTA NEMA DOSTATOK VOLNEHO MIESTA"
+                        : "SD KARTA NIE JE DOSTUPNA",
+                    COLOR_ERROR,
+                    4000
+                );
+
+                updateMessageStrip();
+            }
+            else
+            {
+                openKeyboard(
+                    EditField::Station
+                );
+            }
         }
 
         return;
@@ -13798,7 +15358,9 @@ void loop()
                 persistActiveSessionState();
 
                 setStatusMessage(
-                    "CHYBA AUTOMATICKEHO ZAPISU - KONTROLA SD",
+                    sdWriteBlockedBySpace
+                        ? "SD KARTA JE PLNA - AUTOMATICKY ZAPIS ZASTAVENY"
+                        : "CHYBA AUTOMATICKEHO ZAPISU - KONTROLA SD",
                     COLOR_ERROR,
                     5000
                 );
@@ -13810,6 +15372,11 @@ void loop()
             updateStatusPanel();
             updateMessageStrip();
         }
+    }
+
+    if (sdReady)
+    {
+        refreshSdSpaceInfo(false);
     }
 
     updateLiveGraphScreen(
