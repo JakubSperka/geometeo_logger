@@ -22,7 +22,7 @@
 // ============================================================
 
 constexpr char APP_NAME[] = "GEOMETEO LOGGER";
-constexpr char APP_VERSION[] = "v0.9.0 (STABLE)";
+constexpr char APP_VERSION[] = "v0.9.1 (STABLE)";
 
 // ============================================================
 // HARDVER: INTERNA I2C ZBERNICA - DOTYK
@@ -14062,14 +14062,63 @@ void confirmKeyboardValue()
 
             lastAutoWriteOk = false;
 
-            setStatusMessage(
-                startWriteOk
-                    ? "NOVA RELACIA SPUSTENA"
-                    : "RELACIA BEZI - CHYBA START ZAZNAMU",
-                startWriteOk
-                    ? COLOR_OK
-                    : COLOR_WARNING
-            );
+            if (startWriteOk)
+            {
+                // Prvy automaticky zaznam sa vykona okamzite
+                // po zalozeni relacie. Dalsie zaznamy uz
+                // pokracuju podla nastaveneho intervalu.
+                currentMeasurement = readMeasurement();
+
+                if (currentMeasurement.valid)
+                {
+                    lastAutoWriteOk =
+                        appendMeasurementToSession(
+                            currentMeasurement,
+                            "AUTO",
+                            station,
+                            ""
+                        );
+                }
+
+                // Interval dalsieho AUTO zaznamu sa pocita
+                // od okamihu prveho pokusu o meranie.
+                lastAutoLogMillis = millis();
+
+                if (lastAutoWriteOk)
+                {
+                    setStatusMessage(
+                        "RELACIA SPUSTENA - PRVY ZAZNAM ULOZENY",
+                        COLOR_OK
+                    );
+                }
+                else if (!currentMeasurement.valid)
+                {
+                    setStatusMessage(
+                        measurementErrorText(
+                            lastMeasurementError
+                        ),
+                        COLOR_ERROR,
+                        4000
+                    );
+                }
+                else
+                {
+                    setStatusMessage(
+                        sdWriteBlockedBySpace
+                            ? "RELACIA SPUSTENA - SD KARTA JE PLNA"
+                            : "RELACIA SPUSTENA - PRVY ZAZNAM NEULOZENY",
+                        COLOR_ERROR,
+                        5000
+                    );
+                }
+            }
+            else
+            {
+                setStatusMessage(
+                    "RELACIA BEZI - CHYBA START ZAZNAMU",
+                    COLOR_WARNING
+                );
+            }
         }
     }
     else if (editedField == EditField::TargetPoint)
